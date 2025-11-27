@@ -1,194 +1,239 @@
 #![feature(macro_metavar_expr)]
 
-pub use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-pub use std::mem::{align_of, size_of};
-pub use std::ptr::{self, null_mut};
-pub use std::slice;
-
 #[macro_export]
 macro_rules! sibling_vecs {
-    ($name:ident, $($ty:ty),* $(,)?) => {
-        #[doc(hidden)]
-        pub mod __sibling_vecs_impl {
-            use super::*;
+    (
+        $vis:vis struct $name:ident {
+            $( $field:ident : $type:ty ),* $(,)?
+        }
+    ) => {
+        // Main struct for all sibling sub-vecs.
+        $vis struct $name {
+            ptr: *mut u8,
+            len: usize,
+            cap: usize,
+        }
 
-            macro_rules! reverse_copy {
-                ($self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
-                    reverse_copy_helper!( ; $($ty),* ; $self, $new_ptr, $old_offs, $new_offs, $len)
-                };
+        impl $name {
+            pub const N: usize = ${count($type)};
+
+            pub fn new() -> Self {
+                Self {
+                    ptr: std::ptr::null_mut(),
+                    len: 0,
+                    cap: 0,
+                }
+            }
+            pub fn with_capacity(cap: usize) -> Self {
+                let mut s = Self::new();
+                s.reallocate_to(cap);
+                s
             }
 
-            macro_rules! reverse_copy_helper {
-                ( $$($$rev:ty),* ; $curr:ty , $$($$rest:ty),* ; $self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
-                    reverse_copy_helper!( $curr , $$($$rev),* ; $$($$rest),* ; $self, $new_ptr, $old_offs, $new_offs, $len)
-                };
-                ( $$($$rev:ty),* ; ; $self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
-                    let n = Self::N;
-                    let mut _i = 0;
-                    $$(
-                        let idx = n - 1 - _i;
-                        unsafe { ptr::copy_nonoverlapping(
-                            $self.ptr.add($old_offs[idx]),
-                            $new_ptr.add($new_offs[idx]),
-                            $len * size_of::<$rev>(),
-                        ); }
-                        _i += 1;
-                    )*
-                };
+            pub fn len(&self) -> usize {
+                self.len
+            }
+            pub fn capacity(&self) -> usize {
+                self.cap
             }
 
-            macro_rules! reverse_drop {
-                ($self:expr, $offs:expr, $len:expr) => {
-                    reverse_drop_helper!( ; $($ty),* ; $self, $offs, $len)
-                };
+            const fn type_infos() -> [(usize, usize); Self::N] {
+                [ $( (std::mem::size_of::<$type>(), std::mem::align_of::<$type>()) ),* ]
             }
 
-            macro_rules! reverse_drop_helper {
-                ( $$($$rev:ty),* ; $curr:ty , $$($$rest:ty),* ; $self:expr, $offs:expr, $len:expr) => {
-                    reverse_drop_helper!( $curr , $$($$rev),* ; $$($$rest),* ; $self, $offs, $len)
-                };
-                ( $$($$rev:ty),* ; ; $self:expr, $offs:expr, $len:expr) => {
-                    let n = Self::N;
-                    let mut _i = 0;
-                    $$(
-                        let idx = n - 1 - _i;
-                        unsafe {
-                            let base = $self.ptr.add($offs[idx]);
-                            for j in 0..$len {
-                                ptr::drop_in_place(base.add(j * size_of::<$rev>()) as *mut $rev);
-                            }
+            fn offsets(cap: usize) -> [usize; Self::N] {
+                let infos = Self::type_infos();
+                let mut out = [0; Self::N];
+                let mut current_offset = 0;
+
+                let mut i = 0;
+                // TODO: should we manually unroll with macro? Where does it start optimizing away?
+                while i < Self::N {
+                    let (size, align) = infos[i];
+
+                    if align > 0 {
+                        let remainder = current_offset % align;
+                        if remainder != 0 {
+                            current_offset += align - remainder;
                         }
-                        _i += 1;
-                    )*
-                };
+                    }
+
+                    out[i] = current_offset;
+                    current_offset += cap * size;
+                    i += 1;
+                }
+                out
             }
 
-            pub struct $name {
-                len: usize,
-                cap: usize,
-                ptr: *mut u8,
+            fn layout(cap: usize) -> std::alloc::Layout {
+                if cap == 0 {
+                    return std::alloc::Layout::new::<u8>();
+                }
+
+                let infos = Self::type_infos();
+                let offsets = Self::offsets(cap);
+
+                let last_idx = Self::N - 1;
+                let (last_size, _) = infos[last_idx];
+                let total_size = offsets[last_idx] + (cap * last_size);
+
+                let mut max_align = 1;
+                let mut i = 0;
+                while i < Self::N {
+                    let (_, align) = infos[i];
+                    if align > max_align { max_align = align; }
+                    i += 1;
+                }
+
+                std::alloc::Layout::from_size_align(total_size, max_align).unwrap()
             }
 
-            impl $name {
-                pub fn new() -> Self {
-                    Self::with_capacity(0)
-                }
+            // Helper function for allocation-related stuff.
+            fn reallocate_to(&mut self, new_cap: usize) {
+                let old_cap = self.cap;
+                if new_cap == old_cap { return; }
 
-                pub fn with_capacity(cap: usize) -> Self {
-                    if cap == 0 {
-                        return Self { len: 0, cap: 0, ptr: null_mut() };
+                // deallocate
+                if new_cap == 0 {
+                    if old_cap > 0 {
+                        unsafe {
+                            std::alloc::dealloc(self.ptr, Self::layout(old_cap));
+                        }
                     }
-                    let size = Self::total_size_with_cap(cap);
-                    let align = Self::max_align();
-                    let layout = Layout::from_size_align(size, align).unwrap();
-                    let ptr = unsafe { alloc(layout) };
-                    if ptr.is_null() {
-                        handle_alloc_error(layout);
-                    }
-                    Self { len: 0, cap, ptr }
+                    self.ptr = std::ptr::null_mut();
+                    self.cap = 0;
+                    self.len = 0;
+                    return;
                 }
 
-                fn max_align() -> usize {
-                    let mut ma = 1;
-                    $(ma = ma.max(align_of::<$ty>());)*
-                    ma
-                }
+                let old_layout = Self::layout(old_cap);
+                let new_layout = Self::layout(new_cap);
 
-                fn total_size_with_cap(cap: usize) -> usize {
-                    let mut current = 0;
-                    $({
-                        let a = align_of::<$ty>();
-                        current = (current + a - 1) / a * a;
-                        current += cap * size_of::<$ty>();
-                    })*
-                    current
-                }
+                unsafe {
+                    // alloc or realloc
+                    let new_ptr = if old_cap == 0 {
+                        std::alloc::alloc(new_layout)
+                    } else {
+                        // TODO: realloc nullptr?
+                        std::alloc::realloc(self.ptr, old_layout, new_layout.size())
+                    };
 
-                const N: usize = ${count($ty)};
+                    if new_ptr.is_null() { std::alloc::handle_alloc_error(new_layout); }
 
-                fn compute_offsets_with_cap(cap: usize) -> [usize; Self::N] {
-                    let mut offs = [0; Self::N];
-                    let mut current = 0;
-                    let mut i = 0;
-                    $({
-                        let a = align_of::<$ty>();
-                        current = (current + a - 1) / a * a;
-                        offs[i] = current;
-                        current += cap * size_of::<$ty>();
-                        i += 1;
-                    })*
-                    offs
-                }
-
-                fn compute_offsets(&self) -> [usize; Self::N] {
-                    Self::compute_offsets_with_cap(self.cap)
-                }
-
-                pub fn as_slices(&self) -> ($(&[$ty]),*) {
-                    if self.len == 0 {
-                        return ($(&[] as &[$ty]),*);
-                    }
-                    let offs = self.compute_offsets();
-                    ($(
-                        unsafe { slice::from_raw_parts(self.ptr.add(offs[${index()}]) as *const $ty, self.len) }
-                    ),*)
-                }
-
-                pub fn as_mut_slices(&mut self) -> ($(&mut [$ty]),*) {
-                    if self.len == 0 {
-                        return ($(&mut [] as &mut [$ty]),*);
-                    }
-                    let offs = self.compute_offsets();
-                    ($(
-                        unsafe { slice::from_raw_parts_mut(self.ptr.add(offs[${index()}]) as *mut $ty, self.len) }
-                    ),*)
-                }
-
-                pub fn push(&mut self, values: ($($ty,)*)) {
-                    if self.len == self.cap {
-                        self.reserve();
-                    }
-                    let offs = self.compute_offsets();
-                    let pos = self.len;
-                    $(unsafe {
-                        self.ptr.add(offs[${index()}]).add(pos * size_of::<$ty>()).cast::<$ty>().write(values.${index()});
-                    })*
-                    self.len += 1;
-                }
-
-                fn reserve(&mut self) {
-                    let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-                    let new_size = Self::total_size_with_cap(new_cap);
-                    let align = Self::max_align();
-                    let layout = Layout::from_size_align(new_size, align).unwrap();
-                    let new_ptr = unsafe { alloc(layout) };
-                    if new_ptr.is_null() {
-                        handle_alloc_error(layout);
-                    }
-                    let old_offs = Self::compute_offsets_with_cap(self.cap);
-                    let new_offs = Self::compute_offsets_with_cap(new_cap);
-                    reverse_copy!(self, new_ptr, old_offs, new_offs, self.len);
-                    if self.cap != 0 {
-                        let old_size = Self::total_size_with_cap(self.cap);
-                        let old_layout = Layout::from_size_align(old_size, align).unwrap();
-                        unsafe { dealloc(self.ptr, old_layout); }
-                    }
                     self.ptr = new_ptr;
                     self.cap = new_cap;
+                    // TODO: thing is, if we stay in-memory we do actually want shifting
+                    // but when we cant, and realloc would move, we would rather avoid copy-all-then-move and straight up copy once but properly
+
+                    if self.len > 0 && old_cap > 0 {
+                        let old_offsets = Self::offsets(old_cap);
+                        let new_offsets = Self::offsets(new_cap);
+                        let infos = Self::type_infos();
+
+                        // shift data (if realloc)
+                        // reverse because otherwise we will overwrite data of next sub-vec
+                        // from 1 cause 0th does not need to be shifted
+                        for i in (1..Self::N).rev() {
+                            let (size, _) = infos[i];
+                            let size_bytes = self.len * size;
+
+                            let src = self.ptr.add(old_offsets[i]);
+                            let dst = self.ptr.add(new_offsets[i]);
+
+                            std::ptr::copy(src, dst, size_bytes);
+                        }
+                    }
                 }
             }
 
-            impl Drop for $name {
-                fn drop(&mut self) {
-                    if self.len == 0 || self.cap == 0 {
-                        return;
+            fn grow(&mut self) {
+                // does not actually matter, it is intended to never really shrink
+                let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+                self.reallocate_to(new_cap);
+            }
+
+            pub fn push(&mut self, $( $field : $type ),* ) {
+                if self.len == self.cap {
+                    self.grow();
+                }
+
+                let offsets = Self::offsets(self.cap);
+
+                unsafe {
+                    $(
+                        // since we are inside a repetition $()* for methods,
+                        // ${index()} gives us the index of the current iteration
+                        let offset = offsets[${index()}];
+                        let type_base = self.ptr.add(offset) as *mut $type;
+                        type_base.add(self.len).write($field);
+                    )*
+                }
+                self.len += 1;
+            }
+
+            // nice thing is that there is no bounds checking and its up to user
+            pub fn as_slices(&self) -> ( $( &[$type] ),* ) {
+                let offsets = Self::offsets(self.cap);
+                unsafe {
+                    (
+                        $(
+                            std::slice::from_raw_parts(
+                                self.ptr.add(offsets[${index()}]) as *const $type,
+                                self.len
+                            )
+                        ),*
+                    )
+                }
+            }
+
+            // nice thing is that there is no bounds checking and its up to user
+            pub fn as_mut_slices(&mut self) -> ( $( &mut [$type] ),* ) {
+                let offsets = Self::offsets(self.cap);
+                unsafe {
+                    (
+                        $(
+                            std::slice::from_raw_parts_mut(
+                                self.ptr.add(offsets[${index()}]) as *mut $type,
+                                self.len
+                            )
+                        ),*
+                    )
+                }
+            }
+
+            $(
+                pub fn $field(&self) -> &[$type] {
+                     let offsets = Self::offsets(self.cap);
+                     let idx = ${index()};
+                     unsafe {
+                         std::slice::from_raw_parts(
+                             self.ptr.add(offsets[idx]) as *const $type,
+                             self.len
+                         )
+                     }
+                }
+            )*
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                if self.cap > 0 {
+                    debug_assert!(!self.ptr.is_null());
+                    let offsets = Self::offsets(self.cap);
+
+                    unsafe {
+                        $(
+                            // should be fine to just drop but anyways
+                            if std::mem::needs_drop::<$type>() {
+                                let offset = offsets[${index()}];
+                                let base = self.ptr.add(offset) as *mut $type;
+                                for i in 0..self.len {
+                                    std::ptr::drop_in_place(base.add(i));
+                                }
+                            }
+                        )*
+                        std::alloc::dealloc(self.ptr, Self::layout(self.cap));
                     }
-                    let offs = self.compute_offsets();
-                    reverse_drop!(self, offs, self.len);
-                    let align = Self::max_align();
-                    let size = Self::total_size_with_cap(self.cap);
-                    let layout = Layout::from_size_align(size, align).unwrap();
-                    unsafe { dealloc(self.ptr, layout); }
                 }
             }
         }
