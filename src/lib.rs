@@ -1,22 +1,75 @@
 #![feature(macro_metavar_expr)]
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::mem::{align_of, size_of};
-use std::ptr::{self, null_mut};
+
+pub use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+pub use std::mem::{align_of, size_of};
+pub use std::ptr::{self, null_mut};
+pub use std::slice;
 
 #[macro_export]
 macro_rules! sibling_vecs {
-    ($name:ident, $($ty:ty),*) => {
+    ($name:ident, $($ty:ty),* $(,)?) => {
         #[doc(hidden)]
-        pub mod $name {
+        pub mod __sibling_vecs_impl {
             use super::*;
 
-            pub struct SiblingVecs {
+            macro_rules! reverse_copy {
+                ($self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
+                    reverse_copy_helper!( ; $($ty),* ; $self, $new_ptr, $old_offs, $new_offs, $len)
+                };
+            }
+
+            macro_rules! reverse_copy_helper {
+                ( $$($$rev:ty),* ; $curr:ty , $$($$rest:ty),* ; $self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
+                    reverse_copy_helper!( $curr , $$($$rev),* ; $$($$rest),* ; $self, $new_ptr, $old_offs, $new_offs, $len)
+                };
+                ( $$($$rev:ty),* ; ; $self:expr, $new_ptr:expr, $old_offs:expr, $new_offs:expr, $len:expr) => {
+                    let n = Self::N;
+                    let mut _i = 0;
+                    $$(
+                        let idx = n - 1 - _i;
+                        unsafe { ptr::copy_nonoverlapping(
+                            $self.ptr.add($old_offs[idx]),
+                            $new_ptr.add($new_offs[idx]),
+                            $len * size_of::<$rev>(),
+                        ); }
+                        _i += 1;
+                    )*
+                };
+            }
+
+            macro_rules! reverse_drop {
+                ($self:expr, $offs:expr, $len:expr) => {
+                    reverse_drop_helper!( ; $($ty),* ; $self, $offs, $len)
+                };
+            }
+
+            macro_rules! reverse_drop_helper {
+                ( $$($$rev:ty),* ; $curr:ty , $$($$rest:ty),* ; $self:expr, $offs:expr, $len:expr) => {
+                    reverse_drop_helper!( $curr , $$($$rev),* ; $$($$rest),* ; $self, $offs, $len)
+                };
+                ( $$($$rev:ty),* ; ; $self:expr, $offs:expr, $len:expr) => {
+                    let n = Self::N;
+                    let mut _i = 0;
+                    $$(
+                        let idx = n - 1 - _i;
+                        unsafe {
+                            let base = $self.ptr.add($offs[idx]);
+                            for j in 0..$len {
+                                ptr::drop_in_place(base.add(j * size_of::<$rev>()) as *mut $rev);
+                            }
+                        }
+                        _i += 1;
+                    )*
+                };
+            }
+
+            pub struct $name {
                 len: usize,
                 cap: usize,
                 ptr: *mut u8,
             }
 
-            impl SiblingVecs {
+            impl $name {
                 pub fn new() -> Self {
                     Self::with_capacity(0)
                 }
@@ -36,9 +89,9 @@ macro_rules! sibling_vecs {
                 }
 
                 fn max_align() -> usize {
-                    let mut ma = 0;
+                    let mut ma = 1;
                     $(ma = ma.max(align_of::<$ty>());)*
-                    if ma == 0 { 1 } else { ma }
+                    ma
                 }
 
                 fn total_size_with_cap(cap: usize) -> usize {
@@ -51,17 +104,15 @@ macro_rules! sibling_vecs {
                     current
                 }
 
-                const N: usize = $crate::__count_ty!($($ty),*);
+                const N: usize = ${count($ty)};
 
                 fn compute_offsets_with_cap(cap: usize) -> [usize; Self::N] {
-                    let mut offs = [0usize; Self::N];
-                    let mut current: usize = 0;
+                    let mut offs = [0; Self::N];
+                    let mut current = 0;
                     let mut i = 0;
                     $({
                         let a = align_of::<$ty>();
-                        if a > 1 {
-                            current = (current + a - 1) / a * a;
-                        }
+                        current = (current + a - 1) / a * a;
                         offs[i] = current;
                         current += cap * size_of::<$ty>();
                         i += 1;
@@ -74,16 +125,22 @@ macro_rules! sibling_vecs {
                 }
 
                 pub fn as_slices(&self) -> ($(&[$ty]),*) {
+                    if self.len == 0 {
+                        return ($(&[] as &[$ty]),*);
+                    }
                     let offs = self.compute_offsets();
                     ($(
-                        unsafe { ::std::slice::from_raw_parts(self.ptr.add(offs[${index(ty)}]) as *const $ty, self.len) }
+                        unsafe { slice::from_raw_parts(self.ptr.add(offs[${index()}]) as *const $ty, self.len) }
                     ),*)
                 }
 
                 pub fn as_mut_slices(&mut self) -> ($(&mut [$ty]),*) {
+                    if self.len == 0 {
+                        return ($(&mut [] as &mut [$ty]),*);
+                    }
                     let offs = self.compute_offsets();
                     ($(
-                        unsafe { ::std::slice::from_raw_parts_mut(self.ptr.add(offs[$${index(ty)}]) as *mut $ty, self.len) }
+                        unsafe { slice::from_raw_parts_mut(self.ptr.add(offs[${index()}]) as *mut $ty, self.len) }
                     ),*)
                 }
 
@@ -92,19 +149,15 @@ macro_rules! sibling_vecs {
                         self.reserve();
                     }
                     let offs = self.compute_offsets();
-                    $({
-                        unsafe {
-                            ptr::write(
-                                self.ptr.add(offs[$${index(ty)}]).add(self.len * size_of::<$ty>()) as *mut $ty,
-                                values.$${index(ty)}
-                            );
-                        }
+                    let pos = self.len;
+                    $(unsafe {
+                        self.ptr.add(offs[${index()}]).add(pos * size_of::<$ty>()).cast::<$ty>().write(values.${index()});
                     })*
                     self.len += 1;
                 }
 
                 fn reserve(&mut self) {
-                    let new_cap = if self.cap == 0 { 8 } else { self.cap * 2 };
+                    let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
                     let new_size = Self::total_size_with_cap(new_cap);
                     let align = Self::max_align();
                     let layout = Layout::from_size_align(new_size, align).unwrap();
@@ -114,19 +167,7 @@ macro_rules! sibling_vecs {
                     }
                     let old_offs = Self::compute_offsets_with_cap(self.cap);
                     let new_offs = Self::compute_offsets_with_cap(new_cap);
-                    let len = self.len;
-                    let num = Self::N;
-                    for i in 0..num {
-                        let idx = num - 1 - i;
-                        let ty_size = size_of::<$${index(idx, ty)}>();
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                self.ptr.add(old_offs[idx]),
-                                new_ptr.add(new_offs[idx]),
-                                len * ty_size,
-                            );
-                        }
-                    }
+                    reverse_copy!(self, new_ptr, old_offs, new_offs, self.len);
                     if self.cap != 0 {
                         let old_size = Self::total_size_with_cap(self.cap);
                         let old_layout = Layout::from_size_align(old_size, align).unwrap();
@@ -137,39 +178,19 @@ macro_rules! sibling_vecs {
                 }
             }
 
-            impl Drop for SiblingVecs {
+            impl Drop for $name {
                 fn drop(&mut self) {
-                    if self.cap == 0 {
+                    if self.len == 0 || self.cap == 0 {
                         return;
                     }
                     let offs = self.compute_offsets();
-                    let len = self.len;
-                    let num = Self::N;
-                    for i in 0..num {
-                        let idx = num - 1 - i;
-                        unsafe {
-                            let base = self.ptr.add(offs[idx]);
-                            let ty = $${index(idx, ty)};
-                            for j in (0..len).rev() {  // Drop in reverse order per column
-                                ptr::drop_in_place(base.add(j * size_of::<ty>()) as *mut ty);
-                            }
-                        }
-                    }
+                    reverse_drop!(self, offs, self.len);
                     let align = Self::max_align();
                     let size = Self::total_size_with_cap(self.cap);
                     let layout = Layout::from_size_align(size, align).unwrap();
                     unsafe { dealloc(self.ptr, layout); }
                 }
             }
-        }
-
-        pub use __sibling_vecs_impl_$name::SiblingVecs as $name;
-
-        // Helper to get count (since ${count} not directly usable in const)
-        #[doc(hidden)]
-        macro_rules! __count_ty {
-            () => { 0 };
-            ($_head:ty $$(, $$_tail:ty)*) => { 1 + $crate::__count_ty!($$($$_tail),*) };
         }
     };
 }
