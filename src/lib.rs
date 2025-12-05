@@ -1,4 +1,5 @@
 #![feature(macro_metavar_expr)]
+#![feature(macro_metavar_expr_concat)]
 
 #[macro_export]
 macro_rules! sibling_vecs {
@@ -152,6 +153,59 @@ macro_rules! sibling_vecs {
                 self.reallocate_to(new_cap);
             }
 
+
+            pub fn swap_remove(&mut self, index: usize) -> ($( $type ),*) {
+                debug_assert!(index < self.len);
+
+                let offsets = Self::offsets(self.cap);
+                let last_idx = self.len - 1;
+
+                unsafe {
+                    let result = (
+                        $(
+                            {
+                                let offset = offsets[${index()}];
+                                let base = self.ptr.add(offset) as *mut $type;
+                                let dst = base.add(index);
+
+                                let val = std::ptr::read(dst);
+
+                                if index != last_idx {
+                                    let src = base.add(last_idx);
+                                    std::ptr::copy_nonoverlapping(src, dst, 1);
+                                }
+
+                                val
+                            }
+                        ),*
+                    );
+                    self.len -= 1;
+
+                    result
+                }
+            }
+
+            pub fn clear(&mut self) {
+                if self.len == 0 { return; }
+
+                let offsets = Self::offsets(self.cap);
+                let len = self.len;
+
+                unsafe {
+                    $(
+                        if std::mem::needs_drop::<$type>() {
+                            let offset = offsets[${index()}];
+                            let base = self.ptr.add(offset) as *mut $type;
+                            for i in 0..len {
+                                std::ptr::drop_in_place(base.add(i));
+                            }
+                        }
+                    )*
+                }
+                self.len = 0;
+            }
+
+            #[allow(nonstandard_style)]
             pub fn push(&mut self, $( $field : $type ),* ) {
                 if self.len == self.cap {
                     self.grow();
@@ -202,15 +256,36 @@ macro_rules! sibling_vecs {
             }
 
             $(
+                #[allow(nonstandard_style)]
                 pub fn $field(&self) -> &[$type] {
                      let offsets = Self::offsets(self.cap);
-                     let idx = ${index()};
                      unsafe {
                          std::slice::from_raw_parts(
-                             self.ptr.add(offsets[idx]) as *const $type,
+                             self.ptr.add(offsets[${index()}]) as *const $type,
                              self.len
                          )
                      }
+                }
+            )*
+
+            $(
+                #[allow(nonstandard_style)]
+                pub fn ${concat($field, _mut)}(&self) -> &mut [$type] {
+                     let offsets = Self::offsets(self.cap);
+                     unsafe {
+                         std::slice::from_raw_parts_mut(
+                             self.ptr.add(offsets[${index()}]) as *mut $type,
+                             self.len
+                         )
+                     }
+                }
+            )*
+
+            $(
+                #[allow(nonstandard_style)]
+                pub fn ${concat($field, _mut_ptr)}(&self) -> *mut $type {
+                    let offsets = Self::offsets(self.cap);
+                    unsafe { self.ptr.add(offsets[${index()}]) as *mut $type }
                 }
             )*
         }

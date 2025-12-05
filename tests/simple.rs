@@ -1,5 +1,6 @@
 #![allow(unused)]
 #![feature(macro_metavar_expr)]
+#![feature(macro_metavar_expr_concat)]
 
 #[cfg(test)]
 mod tests {
