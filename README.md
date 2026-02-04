@@ -1,0 +1,1 @@
+Multiple Vecs, but all in same allocation and all the same size. Made for ec-rs (entity component arrays)
